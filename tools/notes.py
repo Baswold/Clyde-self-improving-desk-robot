@@ -5,30 +5,23 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 NOTES_FILE = ROOT / "memory" / "notes.md"
 
-# Two tools in one file — both registered at load time via SCHEMAS list.
-# core.py's _load_tool_file handles a single SCHEMA; we register the second
-# manually by exporting EXTRA_SCHEMAS and EXTRA_FNS for core to pick up.
-# Simpler approach: split into two schemas, register both from one module
-# by using a list. core.py checks for SCHEMA (singular) so we register
-# write_note as SCHEMA and expose read_notes separately via EXTRA.
-
-SCHEMA = {
-    "name": "write_note",
-    "description": (
-        "Append a titled note to memory/notes.md. "
-        "Use for project summaries, findings, autonomous work results, anything worth remembering long-form."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string", "description": "Note title."},
-            "body": {"type": "string", "description": "Note content (markdown ok)."}
+SCHEMAS = [
+    {
+        "name": "write_note",
+        "description": (
+            "Append a titled note to memory/notes.md. "
+            "Use for project summaries, findings, autonomous work results — "
+            "anything worth remembering long-form."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Note title."},
+                "body": {"type": "string", "description": "Note content (markdown ok)."},
+            },
+            "required": ["title", "body"],
         },
-        "required": ["title", "body"]
-    }
-}
-
-EXTRA_SCHEMAS = [
+    },
     {
         "name": "read_notes",
         "description": "Read notes from memory/notes.md. Optionally filter by keyword.",
@@ -37,12 +30,12 @@ EXTRA_SCHEMAS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Optional keyword to filter notes by title or content."
-                }
+                    "description": "Optional keyword to filter notes by title or content.",
+                },
             },
-            "required": []
-        }
-    }
+            "required": [],
+        },
+    },
 ]
 
 
@@ -60,7 +53,6 @@ def read_notes(query: str = "") -> str:
         return "No notes yet."
     text = NOTES_FILE.read_text(encoding="utf-8")
     if not query:
-        # Return last ~3000 chars (most recent notes)
         return text[-3000:] if len(text) > 3000 else text
 
     q = query.lower()
@@ -69,15 +61,3 @@ def read_notes(query: str = "") -> str:
     if not matches:
         return f"No notes matching '{query}'."
     return "\n## ".join(matches[-10:])
-
-
-# Register read_notes alongside write_note at load time
-def _register_extra():
-    try:
-        from clyde import _registry
-        _registry.register(EXTRA_SCHEMAS[0], read_notes)
-    except Exception:
-        pass
-
-
-_register_extra()
