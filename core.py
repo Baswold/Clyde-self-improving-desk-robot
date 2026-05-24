@@ -3,8 +3,8 @@
 Clyde — self-improving AI agent.
 
 Run modes:
-  python core.py            # text mode (no API key needed beyond LLM)
-  python core.py --voice    # Qwen Omni Realtime (needs DASHSCOPE_API_KEY)
+  python core.py            # text mode
+  python core.py --voice    # Qwen3-Omni realtime (needs DASHSCOPE_API_KEY)
 
 LLM backend for text mode (checked in order):
   ANTHROPIC_API_KEY  → Anthropic SDK
@@ -14,6 +14,7 @@ LLM backend for text mode (checked in order):
 import importlib.util
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -24,22 +25,56 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.resolve()
 TOOLS_DIR = ROOT / "tools"
 MEMORY_DIR = ROOT / "memory"
 
 MAX_TOOL_ROUNDS = 20
-MAX_HISTORY_MESSAGES = 12   # keep this many recent messages
-MAX_TOOL_RESULT = 4000      # chars before truncation
-BACKGROUND_INTERVAL = 300   # seconds between idle work cycles
+MAX_HISTORY_MESSAGES = 12       # keep this many recent messages
+MAX_TOOL_RESULT = 4000          # chars before truncation
+BACKGROUND_INTERVAL = 300       # seconds between deep-work cycles
+SCHEDULER_TICK = 1.0            # seconds between scheduler checks
+AMBIENT_INTERVAL = 0            # 0 = disabled; set >0 to enable ambient ticks
 
 for d in [TOOLS_DIR, MEMORY_DIR, ROOT / "workspace", ROOT / "backups"]:
     d.mkdir(parents=True, exist_ok=True)
 
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+# Put project root on sys.path so tools and _registry import cleanly,
+# whether the program is launched from this directory or elsewhere.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from clyde import _registry  # noqa: E402
+import _registry  # noqa: E402
+
+
+# ── Proactive output channel ──────────────────────────────────────────────────
+#
+# Anything Clyde wants to say without being prompted (scheduler firings,
+# ambient observations, follow-ups) goes through here. The text mode loop
+# drains it between prompts; voice mode hands it to TTS.
+
+PROACTIVE: "queue.Queue[str]" = queue.Queue()
+PRINT_LOCK = threading.Lock()
+
+
+def say_proactively(text: str) -> None:
+    """Queue a message for Clyde to deliver outside of a user turn."""
+    PROACTIVE.put(text)
+    log_event("proactive", {"text": text[:300]})
+
+
+def _drain_proactive(prefix: str = "Clyde") -> None:
+    """Print any pending proactive messages. Called between user prompts."""
+    drained = []
+    while True:
+        try:
+            drained.append(PROACTIVE.get_nowait())
+        except queue.Empty:
+            break
+    if drained:
+        with PRINT_LOCK:
+            for msg in drained:
+                print(f"\n{prefix}: {msg}", flush=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -58,41 +93,64 @@ def truncate(text: str, limit: int) -> str:
 def log_event(kind: str, data: object) -> None:
     events_file = MEMORY_DIR / "events.jsonl"
     entry = {"time": now(), "kind": kind, "data": data}
-    with events_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        with events_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 # ── Tool loading ──────────────────────────────────────────────────────────────
+#
+# A tool file may declare either:
+#   SCHEMA  = {...}              and a function whose name matches schema["name"]
+#   SCHEMAS = [{...}, {...}]     and one function per schema name
+# Either form is fine; both are picked up here.
 
-def load_tools() -> None:
+def load_tools() -> int:
+    count = 0
     for path in sorted(TOOLS_DIR.glob("*.py")):
         if path.stem.startswith("_"):
             continue
-        _load_tool_file(path)
+        count += _load_tool_file(path)
+    return count
 
 
-def _load_tool_file(path: Path) -> bool:
+def _load_tool_file(path: Path) -> int:
     try:
-        spec = importlib.util.spec_from_file_location(path.stem, path)
+        spec = importlib.util.spec_from_file_location(f"tool_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        schema = getattr(mod, "SCHEMA", None)
-        if not isinstance(schema, dict):
-            return False
-        name = schema.get("name", "")
-        if not name or not hasattr(mod, name):
-            return False
-        _registry.register(schema, getattr(mod, name))
-        return True
     except Exception as e:
         print(f"[clyde] Failed to load tool {path.name}: {e}", file=sys.stderr)
-        return False
+        return 0
+
+    schemas: list = []
+    if isinstance(getattr(mod, "SCHEMA", None), dict):
+        schemas.append(mod.SCHEMA)
+    extra = getattr(mod, "SCHEMAS", None)
+    if isinstance(extra, list):
+        schemas.extend(s for s in extra if isinstance(s, dict))
+
+    registered = 0
+    for schema in schemas:
+        name = schema.get("name", "")
+        fn = getattr(mod, name, None)
+        if not name or not callable(fn):
+            print(
+                f"[clyde] Tool {path.name}: schema {name!r} has no matching function",
+                file=sys.stderr,
+            )
+            continue
+        _registry.register(schema, fn)
+        registered += 1
+    return registered
 
 
 # ── History compaction ────────────────────────────────────────────────────────
 
 def compact_history(history: list, memo: str) -> tuple[list, str]:
-    """Fold old messages into memo, keep recent window."""
+    """Fold old messages into a memo, keep only the recent window."""
     if len(history) <= MAX_HISTORY_MESSAGES:
         return history, memo
 
@@ -104,12 +162,11 @@ def compact_history(history: list, memo: str) -> tuple[list, str]:
         role = msg.get("role", "?")
         content = msg.get("content", "")
         if isinstance(content, list):
-            # tool results or assistant blocks
             names = []
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "tool_use":
-                        names.append(block.get("name", "?"))
+                        names.append(f"→{block.get('name', '?')}")
                     elif block.get("type") == "tool_result":
                         names.append("tool_result")
                     elif block.get("type") == "text":
@@ -119,12 +176,12 @@ def compact_history(history: list, memo: str) -> tuple[list, str]:
 
     new_memo = truncate(
         (memo + "\nEarlier:\n" + "\n".join(lines)).strip(),
-        8000
+        8000,
     )
     return recent, new_memo
 
 
-# ── Memory context ────────────────────────────────────────────────────────────
+# ── Memory context (injected into every system prompt) ────────────────────────
 
 def memory_context(memo: str = "") -> str:
     parts = []
@@ -135,21 +192,21 @@ def memory_context(memo: str = "") -> str:
     facts_file = MEMORY_DIR / "facts.jsonl"
     if facts_file.exists():
         lines = [l for l in facts_file.read_text().splitlines() if l.strip()]
-        if lines:
-            facts = []
-            for l in lines[-40:]:
-                try:
-                    facts.append(json.loads(l)["fact"])
-                except Exception:
-                    pass
-            if facts:
-                parts.append("## What I remember\n" + "\n".join(f"- {f}" for f in facts))
+        facts = []
+        for l in lines[-40:]:
+            try:
+                facts.append(json.loads(l)["fact"])
+            except Exception:
+                pass
+        if facts:
+            parts.append("## What I remember\n" + "\n".join(f"- {f}" for f in facts))
 
     queue_file = MEMORY_DIR / "work_queue.jsonl"
     if queue_file.exists():
-        lines = [l for l in queue_file.read_text().splitlines() if l.strip()]
         pending = []
-        for l in lines:
+        for l in queue_file.read_text().splitlines():
+            if not l.strip():
+                continue
             try:
                 item = json.loads(l)
                 if not item.get("done"):
@@ -159,15 +216,28 @@ def memory_context(memo: str = "") -> str:
         if pending:
             parts.append("## Work queue\n" + "\n".join(f"- {i}" for i in pending[-10:]))
 
+    sched_file = MEMORY_DIR / "schedule.jsonl"
+    if sched_file.exists():
+        upcoming = []
+        for l in sched_file.read_text().splitlines():
+            if not l.strip():
+                continue
+            try:
+                e = json.loads(l)
+                if not e.get("fired") and not e.get("cancelled"):
+                    upcoming.append(f"{e.get('trigger_time')}: {e.get('label', e.get('body', ''))}")
+            except Exception:
+                pass
+        if upcoming:
+            parts.append("## Upcoming\n" + "\n".join(f"- {i}" for i in upcoming[-10:]))
+
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
-
-# ── System prompt ─────────────────────────────────────────────────────────────
 
 def system_prompt(memo: str = "") -> str:
     prompt_file = ROOT / "system_prompt.md"
     base = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else "You are Clyde."
-    return base + memory_context(memo)
+    return base + "\n\n## Current time\n" + now() + memory_context(memo)
 
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────
@@ -188,12 +258,16 @@ def dispatch(name: str, inputs: dict) -> str:
         return err
 
 
-# ── LLM client ───────────────────────────────────────────────────────────────
+# ── LLM client ────────────────────────────────────────────────────────────────
 
 def make_client():
     if os.getenv("ANTHROPIC_API_KEY"):
         import anthropic
-        return anthropic.Anthropic(), os.getenv("CLYDE_MODEL", "claude-sonnet-4-6"), "anthropic"
+        return (
+            anthropic.Anthropic(),
+            os.getenv("CLYDE_MODEL", "claude-sonnet-4-6"),
+            "anthropic",
+        )
 
     if os.getenv("OPENROUTER_API_KEY"):
         from openai import OpenAI
@@ -201,7 +275,11 @@ def make_client():
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
-        return client, os.getenv("CLYDE_MODEL", "anthropic/claude-sonnet-4-6"), "openrouter"
+        return (
+            client,
+            os.getenv("CLYDE_MODEL", "anthropic/claude-sonnet-4-6"),
+            "openrouter",
+        )
 
     return None, None, None
 
@@ -250,8 +328,11 @@ def run_turn(client, model: str, mode: str, history: list, memo: str = "") -> st
                     })
                 history.append({"role": "user", "content": results})
                 rounds += 1
+                continue
 
-        elif mode == "openrouter":
+            return " ".join(text_parts)
+
+        if mode == "openrouter":
             tools_openai = [
                 {
                     "type": "function",
@@ -259,7 +340,7 @@ def run_turn(client, model: str, mode: str, history: list, memo: str = "") -> st
                         "name": s["name"],
                         "description": s["description"],
                         "parameters": s["input_schema"],
-                    }
+                    },
                 }
                 for s in _registry.TOOL_SCHEMAS
             ]
@@ -275,7 +356,7 @@ def run_turn(client, model: str, mode: str, history: list, memo: str = "") -> st
             history.append({
                 "role": "assistant",
                 "content": msg.content or "",
-                "_tool_calls": _tc(msg)
+                "_tool_calls": _tc(msg),
             })
 
             if stop == "stop" or not msg.tool_calls:
@@ -293,9 +374,9 @@ def run_turn(client, model: str, mode: str, history: list, memo: str = "") -> st
                     "content": out,
                 })
             rounds += 1
+            continue
 
-        else:
-            return "(no LLM configured)"
+        return "(no LLM configured)"
 
 
 def _openai_history(history: list) -> list:
@@ -306,7 +387,11 @@ def _openai_history(history: list) -> list:
             if isinstance(content, list):
                 for r in content:
                     if r.get("type") == "tool_result":
-                        out.append({"role": "tool", "tool_call_id": r["tool_use_id"], "content": r["content"]})
+                        out.append({
+                            "role": "tool",
+                            "tool_call_id": r["tool_use_id"],
+                            "content": r["content"],
+                        })
             else:
                 out.append({"role": "user", "content": str(content)})
         elif msg["role"] == "assistant":
@@ -325,13 +410,89 @@ def _tc(msg) -> list:
     if not msg.tool_calls:
         return []
     return [
-        {"id": tc.id, "type": "function",
-         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
         for tc in msg.tool_calls
     ]
 
 
-# ── Background loop ───────────────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+#
+# memory/schedule.jsonl is the source of truth. Each entry:
+#   {id, created, trigger_time (ISO), kind: timer|alarm|message|recurring,
+#    body, label, every_seconds (recurring), source, fired, cancelled}
+# Tools (set_timer, schedule_message, ...) append entries; this loop fires them.
+
+SCHEDULE_FILE = MEMORY_DIR / "schedule.jsonl"
+
+
+def _read_schedule() -> list:
+    if not SCHEDULE_FILE.exists():
+        return []
+    out = []
+    for l in SCHEDULE_FILE.read_text().splitlines():
+        if not l.strip():
+            continue
+        try:
+            out.append(json.loads(l))
+        except Exception:
+            pass
+    return out
+
+
+def _write_schedule(entries: list) -> None:
+    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULE_FILE.write_text(
+        "\n".join(json.dumps(e) for e in entries) + ("\n" if entries else "")
+    )
+
+
+def scheduler_loop() -> None:
+    while True:
+        time.sleep(SCHEDULER_TICK)
+        entries = _read_schedule()
+        if not entries:
+            continue
+
+        changed = False
+        now_iso = now()
+        for e in entries:
+            if e.get("fired") or e.get("cancelled"):
+                continue
+            trig = e.get("trigger_time")
+            if not trig or trig > now_iso:
+                continue
+
+            label = e.get("label") or ""
+            body = e.get("body") or ""
+            kind = e.get("kind", "message")
+            msg = body or label or f"({kind} fired)"
+
+            if kind == "timer":
+                msg = f"Timer{(' — ' + label) if label else ''} done."
+            elif kind == "alarm":
+                msg = f"Alarm{(' — ' + label) if label else ''}."
+            elif kind == "recurring":
+                msg = body or label or "(recurring)"
+
+            say_proactively(msg)
+
+            if kind == "recurring" and e.get("every_seconds"):
+                e["trigger_time"] = datetime.fromisoformat(trig).timestamp() + e["every_seconds"]
+                e["trigger_time"] = datetime.fromtimestamp(e["trigger_time"]).isoformat(timespec="seconds")
+            else:
+                e["fired"] = True
+                e["fired_at"] = now_iso
+            changed = True
+
+        if changed:
+            _write_schedule(entries)
+
+
+# ── Background work loop ──────────────────────────────────────────────────────
 
 def background_loop(client, model: str, mode: str) -> None:
     while True:
@@ -350,7 +511,8 @@ def background_loop(client, model: str, mode: str) -> None:
             continue
 
         idx, item = pending[0]
-        print(f"\n[Clyde] Background: {item['item']}", flush=True)
+        with PRINT_LOCK:
+            print(f"\n[Clyde] Background: {item['item']}", flush=True)
         log_event("background_start", {"item": item["item"]})
 
         history = [{
@@ -358,15 +520,18 @@ def background_loop(client, model: str, mode: str) -> None:
             "content": (
                 f"Autonomous task: {item['item']}\n"
                 f"Why queued: {item.get('reason', '?')}\n\n"
-                f"Before starting: use list_files and recall to check past work. "
-                f"In one sentence justify why this is genuinely different. Then do it. "
-                f"When done, write a note summarising what you built."
-            )
+                "Before starting: use list_files and recall to check past work. "
+                "In one sentence justify why this is genuinely different. Then do it. "
+                "When done, write a note summarising what you built. "
+                "If the result is interesting enough that Basil should know, "
+                "use say_proactively to surface it."
+            ),
         }]
 
         try:
             result = run_turn(client, model, mode, history)
-            print(f"[Clyde] Background done: {result[:200]}", flush=True)
+            with PRINT_LOCK:
+                print(f"[Clyde] Background done: {result[:200]}", flush=True)
             log_event("background_done", {"item": item["item"], "result": result[:500]})
             lines[idx] = json.dumps({
                 **json.loads(lines[idx]),
@@ -375,7 +540,8 @@ def background_loop(client, model: str, mode: str) -> None:
                 "result": result[:300],
             })
         except Exception as e:
-            print(f"[Clyde] Background error: {e}", flush=True)
+            with PRINT_LOCK:
+                print(f"[Clyde] Background error: {e}", flush=True)
             log_event("background_error", {"item": item["item"], "error": str(e)})
             lines[idx] = json.dumps({
                 **json.loads(lines[idx]),
@@ -390,7 +556,7 @@ def background_loop(client, model: str, mode: str) -> None:
 # ── Text mode ─────────────────────────────────────────────────────────────────
 
 def run_text_mode(client, model: str, mode: str) -> None:
-    print(f"Clyde [{mode} / {model}]")
+    print(f"Clyde [{mode} / {model}] — {len(_registry.TOOL_REGISTRY)} tools loaded")
     print("Type to talk. 'bye' to exit.\n")
     log_event("session_start", {"mode": "text", "model": model})
 
@@ -398,6 +564,7 @@ def run_text_mode(client, model: str, mode: str) -> None:
     memo: str = ""
 
     while True:
+        _drain_proactive()
         try:
             user_input = input("you: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -418,26 +585,42 @@ def run_text_mode(client, model: str, mode: str) -> None:
         except Exception as e:
             reply = f"(error: {e})"
 
-        print(f"Clyde: {reply}\n")
+        with PRINT_LOCK:
+            print(f"Clyde: {reply}\n")
         log_event("assistant_reply", {"text": reply[:300]})
 
-        # Compact after each turn
         history, memo = compact_history(history, memo)
 
 
-# ── Voice mode stub ───────────────────────────────────────────────────────────
+# ── Voice mode ────────────────────────────────────────────────────────────────
 
 def run_voice_mode() -> None:
-    print("Voice mode coming — set DASHSCOPE_API_KEY when ready.")
-    # TODO: wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime
-    # PCM audio in → tool calls → cloned voice audio out
+    try:
+        from voice import run as run_voice
+    except Exception as e:
+        print(f"Voice mode unavailable: {e}")
+        print("Make sure voice.py loads and websockets / sounddevice are installed.")
+        return
+    run_voice(
+        tool_dispatch=dispatch,
+        tool_schemas=_registry.TOOL_SCHEMAS,
+        system_prompt=system_prompt,
+        proactive=PROACTIVE,
+        log_event=log_event,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    load_tools()
-    print(f"[Clyde] {len(_registry.TOOL_REGISTRY)} tools: {', '.join(sorted(_registry.TOOL_REGISTRY))}")
+    loaded = load_tools()
+    print(
+        f"[Clyde] {loaded} tools: "
+        + ", ".join(sorted(_registry.TOOL_REGISTRY))
+    )
+
+    # Scheduler always runs (timers + proactive messages work in both modes)
+    threading.Thread(target=scheduler_loop, daemon=True).start()
 
     if "--voice" in sys.argv:
         if not os.getenv("DASHSCOPE_API_KEY"):
@@ -452,7 +635,7 @@ def main() -> None:
         sys.exit(1)
 
     threading.Thread(
-        target=background_loop, args=(client, model, mode), daemon=True
+        target=background_loop, args=(client, model, mode), daemon=True,
     ).start()
 
     run_text_mode(client, model, mode)
