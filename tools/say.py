@@ -6,6 +6,8 @@ ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import _proactive  # shared queue; safe to import (no side effects on the running loop)
+
 SCHEMA = {
     "name": "say_proactively",
     "description": (
@@ -25,6 +27,5 @@ SCHEMA = {
 
 
 def say_proactively(text: str) -> str:
-    from core import say_proactively as _say
-    _say(text)
+    _proactive.say(text)
     return f"Queued proactive message ({len(text)} chars)."

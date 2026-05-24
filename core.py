@@ -14,7 +14,6 @@ LLM backend for text mode (checked in order):
 import importlib.util
 import json
 import os
-import queue
 import sys
 import threading
 import time
@@ -39,40 +38,34 @@ AMBIENT_INTERVAL = 0            # 0 = disabled; set >0 to enable ambient ticks
 for d in [TOOLS_DIR, MEMORY_DIR, ROOT / "workspace", ROOT / "backups"]:
     d.mkdir(parents=True, exist_ok=True)
 
-# Put project root on sys.path so tools and _registry import cleanly,
-# whether the program is launched from this directory or elsewhere.
+# Put project root on sys.path so tools, _registry, _proactive and
+# _schedule import cleanly, whether the program is launched from this
+# directory or elsewhere.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import _registry  # noqa: E402
+import _proactive  # noqa: E402
+import _registry   # noqa: E402
+import _schedule   # noqa: E402
 
 
-# ── Proactive output channel ──────────────────────────────────────────────────
-#
-# Anything Clyde wants to say without being prompted (scheduler firings,
-# ambient observations, follow-ups) goes through here. The text mode loop
-# drains it between prompts; voice mode hands it to TTS.
-
-PROACTIVE: "queue.Queue[str]" = queue.Queue()
-PRINT_LOCK = threading.Lock()
+# Backwards-compatible aliases — older code (and the voice client) expects
+# these names on the core module. They point at the canonical shared
+# objects in _proactive, so importing core a second time would still see
+# the same queue.
+PROACTIVE = _proactive.PROACTIVE
+PRINT_LOCK = _proactive.PRINT_LOCK
 
 
 def say_proactively(text: str) -> None:
-    """Queue a message for Clyde to deliver outside of a user turn."""
-    PROACTIVE.put(text)
+    _proactive.say(text)
     log_event("proactive", {"text": text[:300]})
 
 
 def _drain_proactive(prefix: str = "Clyde") -> None:
-    """Print any pending proactive messages. Called between user prompts."""
-    drained = []
-    while True:
-        try:
-            drained.append(PROACTIVE.get_nowait())
-        except queue.Empty:
-            break
+    drained = _proactive.drain()
     if drained:
-        with PRINT_LOCK:
+        with _proactive.PRINT_LOCK:
             for msg in drained:
                 print(f"\n{prefix}: {msg}", flush=True)
 
@@ -425,71 +418,48 @@ def _tc(msg) -> list:
 #   {id, created, trigger_time (ISO), kind: timer|alarm|message|recurring,
 #    body, label, every_seconds (recurring), source, fired, cancelled}
 # Tools (set_timer, schedule_message, ...) append entries; this loop fires them.
-
-SCHEDULE_FILE = MEMORY_DIR / "schedule.jsonl"
-
-
-def _read_schedule() -> list:
-    if not SCHEDULE_FILE.exists():
-        return []
-    out = []
-    for l in SCHEDULE_FILE.read_text().splitlines():
-        if not l.strip():
-            continue
-        try:
-            out.append(json.loads(l))
-        except Exception:
-            pass
-    return out
+# All file I/O goes through _schedule under a shared lock so appends from
+# tools can't be lost during a read-modify-write here.
 
 
-def _write_schedule(entries: list) -> None:
-    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SCHEDULE_FILE.write_text(
-        "\n".join(json.dumps(e) for e in entries) + ("\n" if entries else "")
-    )
+def _fire(entry: dict) -> None:
+    label = entry.get("label") or ""
+    body = entry.get("body") or ""
+    kind = entry.get("kind", "message")
+    if kind == "timer":
+        msg = f"Timer{(' — ' + label) if label else ''} done."
+    elif kind == "alarm":
+        msg = f"Alarm{(' — ' + label) if label else ''}."
+    else:
+        msg = body or label or f"({kind} fired)"
+    say_proactively(msg)
 
 
 def scheduler_loop() -> None:
     while True:
         time.sleep(SCHEDULER_TICK)
-        entries = _read_schedule()
-        if not entries:
+        # Cheap peek without the lock — avoids contending with tool appends
+        # when nothing is due.
+        if not _schedule.SCHEDULE_FILE.exists():
             continue
 
-        changed = False
+        now_dt = datetime.now()
         now_iso = now()
-        for e in entries:
-            if e.get("fired") or e.get("cancelled"):
-                continue
-            trig = e.get("trigger_time")
-            if not trig or trig > now_iso:
-                continue
 
-            label = e.get("label") or ""
-            body = e.get("body") or ""
-            kind = e.get("kind", "message")
-            msg = body or label or f"({kind} fired)"
+        def fire_due(entries: list) -> list:
+            for e in entries:
+                if not _schedule.due_now(e, now_dt):
+                    continue
+                _fire(e)
+                if e.get("kind") == "recurring" and e.get("every_seconds"):
+                    next_t = _schedule._parse(e["trigger_time"]).timestamp() + e["every_seconds"]
+                    e["trigger_time"] = datetime.fromtimestamp(next_t).isoformat(timespec="seconds")
+                else:
+                    e["fired"] = True
+                    e["fired_at"] = now_iso
+            return entries
 
-            if kind == "timer":
-                msg = f"Timer{(' — ' + label) if label else ''} done."
-            elif kind == "alarm":
-                msg = f"Alarm{(' — ' + label) if label else ''}."
-            elif kind == "recurring":
-                msg = body or label or "(recurring)"
-
-            say_proactively(msg)
-
-            if kind == "recurring" and e.get("every_seconds"):
-                e["trigger_time"] = datetime.fromisoformat(trig).timestamp() + e["every_seconds"]
-                e["trigger_time"] = datetime.fromtimestamp(e["trigger_time"]).isoformat(timespec="seconds")
-            else:
-                e["fired"] = True
-                e["fired_at"] = now_iso
-            changed = True
-
-        if changed:
-            _write_schedule(entries)
+        _schedule.update(fire_due)
 
 
 # ── Background work loop ──────────────────────────────────────────────────────

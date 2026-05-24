@@ -6,14 +6,17 @@ scheduler thread in core.py — when the trigger time passes, the body
 (or a synthesised line for bare timers/alarms) is pushed to Clyde's
 proactive output channel.
 """
-import json
 import re
+import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-SCHEDULE_FILE = ROOT / "memory" / "schedule.jsonl"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import _schedule  # shared, lock-protected store
 
 SCHEMAS = [
     {
@@ -86,31 +89,8 @@ SCHEMAS = [
 ]
 
 
-def _read() -> list:
-    if not SCHEDULE_FILE.exists():
-        return []
-    out = []
-    for l in SCHEDULE_FILE.read_text().splitlines():
-        if not l.strip():
-            continue
-        try:
-            out.append(json.loads(l))
-        except Exception:
-            pass
-    return out
-
-
-def _write(entries: list) -> None:
-    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SCHEDULE_FILE.write_text(
-        "\n".join(json.dumps(e) for e in entries) + ("\n" if entries else "")
-    )
-
-
-def _append(entry: dict) -> None:
-    SCHEDULE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with SCHEDULE_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+_read = _schedule.read
+_append = _schedule.append
 
 
 # ── parsing ───────────────────────────────────────────────────────────────────
@@ -254,15 +234,18 @@ def list_schedules() -> str:
 
 
 def cancel_schedule(id: str) -> str:
-    entries = _read()
-    found = False
-    for e in entries:
-        if e.get("id") == id and not e.get("fired"):
-            e["cancelled"] = True
-            e["cancelled_at"] = datetime.now().isoformat(timespec="seconds")
-            found = True
-            break
-    if not found:
+    found = [False]
+
+    def mutator(entries):
+        for e in entries:
+            if e.get("id") == id and not e.get("fired"):
+                e["cancelled"] = True
+                e["cancelled_at"] = datetime.now().isoformat(timespec="seconds")
+                found[0] = True
+                break
+        return entries
+
+    _schedule.update(mutator)
+    if not found[0]:
         return f"No pending schedule with id {id!r}."
-    _write(entries)
     return f"Cancelled {id}."
