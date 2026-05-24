@@ -33,7 +33,11 @@ MAX_HISTORY_MESSAGES = 12       # keep this many recent messages
 MAX_TOOL_RESULT = 4000          # chars before truncation
 BACKGROUND_INTERVAL = 300       # seconds between deep-work cycles
 SCHEDULER_TICK = 1.0            # seconds between scheduler checks
-AMBIENT_INTERVAL = 0            # 0 = disabled; set >0 to enable ambient ticks
+NOTICE_INTERVAL = int(os.getenv("CLYDE_NOTICE_INTERVAL", "1800"))
+# ^ 0 disables the notice loop. Default 30 min. The loop runs two cheap
+#   LLM calls per candidate (generator + filter), so cost scales with how
+#   often it runs and how much state has accumulated.
+CRITIC_MAX_RETRIES = 2          # how many times the critic can demand a retry
 
 for d in [TOOLS_DIR, MEMORY_DIR, ROOT / "workspace", ROOT / "backups"]:
     d.mkdir(parents=True, exist_ok=True)
@@ -44,7 +48,10 @@ for d in [TOOLS_DIR, MEMORY_DIR, ROOT / "workspace", ROOT / "backups"]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import _critic     # noqa: E402
+import _notice     # noqa: E402
 import _proactive  # noqa: E402
+import _projects   # noqa: E402
 import _registry   # noqa: E402
 import _schedule   # noqa: E402
 
@@ -208,6 +215,22 @@ def memory_context(memo: str = "") -> str:
                 pass
         if pending:
             parts.append("## Work queue\n" + "\n".join(f"- {i}" for i in pending[-10:]))
+
+    try:
+        active_projects = _projects.active()
+    except Exception:
+        active_projects = []
+    if active_projects:
+        parts.append(
+            "## Active projects\n"
+            + "\n".join(
+                f"- [{p['id']}] {p['goal']} "
+                f"({len(p.get('completed_steps', []))}/{len(p.get('plan', []))})"
+                + (f"  blocked on: {p['blocked_on']}"
+                   if p.get('status') == 'blocked' else "")
+                for p in active_projects[:10]
+            )
+        )
 
     sched_file = MEMORY_DIR / "schedule.jsonl"
     if sched_file.exists():
@@ -463,64 +486,190 @@ def scheduler_loop() -> None:
 
 
 # ── Background work loop ──────────────────────────────────────────────────────
+#
+# Each tick:
+#   1. Prefer advancing the least-recently-touched active project. If none,
+#      pull the next pending work-queue item and treat it as a starting
+#      point for a possible new project.
+#   2. Run a turn end-to-end.
+#   3. Send the result through the critic. If the critic says "not done"
+#      and we have retries left, push the critic's missing-list back into
+#      the conversation and try again.
+#   4. Persist the outcome.
+
+def _pick_target() -> tuple | None:
+    """Return ('project', entry) or ('queue', (idx, item)) or None."""
+    active = _projects.active()
+    if active:
+        # Least-recently-advanced first
+        active.sort(key=lambda p: p.get("last_advanced") or p.get("created", ""))
+        return ("project", active[0])
+
+    queue_file = MEMORY_DIR / "work_queue.jsonl"
+    if not queue_file.exists():
+        return None
+    lines = queue_file.read_text().splitlines()
+    for i, l in enumerate(lines):
+        if not l.strip():
+            continue
+        try:
+            item = json.loads(l)
+        except Exception:
+            continue
+        if not item.get("done"):
+            return ("queue", (i, item))
+    return None
+
+
+def _build_project_goal(project: dict) -> str:
+    done_steps = len(project.get("completed_steps", []))
+    plan = project.get("plan", [])
+    if done_steps >= len(plan):
+        return ""  # nothing left to do
+    next_step = plan[done_steps]
+    return (
+        f"Advance project [{project['id']}]: {project['goal']}\n\n"
+        f"Plan ({done_steps}/{len(plan)} done):\n"
+        + "\n".join(
+            f"  {'✓' if i < done_steps else ' '} {s}"
+            for i, s in enumerate(plan)
+        )
+        + f"\n\nDo step {done_steps + 1} end-to-end: {next_step}\n"
+        "When the step is genuinely complete, call advance_project with a "
+        "short description of what you actually did. If you hit a real "
+        "blocker, call advance_project with new_status='blocked' and "
+        "blocked_on explaining what's needed."
+    )
+
+
+def _build_queue_goal(item: dict) -> str:
+    return (
+        f"Autonomous task: {item['item']}\n"
+        f"Why queued: {item.get('reason', '?')}\n\n"
+        "Before starting: use list_files, read_notes, recall, and "
+        "find_in_events to check past work. In one sentence, justify why "
+        "this is genuinely different and worth doing.\n\n"
+        "If this is more than one or two tool calls, call start_project "
+        "first with a plan, then do step 1 in this turn. Otherwise just "
+        "do it.\n\n"
+        "When finished, write_note summarising what you built. If the "
+        "result is interesting enough to interrupt Basil, say_proactively."
+    )
+
 
 def background_loop(client, model: str, mode: str) -> None:
     while True:
         time.sleep(BACKGROUND_INTERVAL)
-        queue_file = MEMORY_DIR / "work_queue.jsonl"
-        if not queue_file.exists():
+
+        target = _pick_target()
+        if not target:
             continue
 
-        lines = queue_file.read_text().splitlines()
-        pending = [
-            (i, json.loads(l))
-            for i, l in enumerate(lines)
-            if l.strip() and not json.loads(l).get("done")
-        ]
-        if not pending:
-            continue
+        kind, payload = target
+        if kind == "project":
+            project = payload
+            goal_text = _build_project_goal(project)
+            if not goal_text:
+                # Plan exhausted but status still active — mark done
+                _projects.update(
+                    project["id"],
+                    lambda e: e.update({"status": "done"}),
+                )
+                continue
+            tag = f"project[{project['id']}]"
+        else:
+            idx, item = payload
+            goal_text = _build_queue_goal(item)
+            tag = f"queue[{idx}]"
 
-        idx, item = pending[0]
         with PRINT_LOCK:
-            print(f"\n[Clyde] Background: {item['item']}", flush=True)
-        log_event("background_start", {"item": item["item"]})
+            print(f"\n[Clyde] Background {tag}: {goal_text.splitlines()[0]}", flush=True)
+        log_event("background_start", {"tag": tag, "goal": goal_text[:300]})
 
-        history = [{
-            "role": "user",
-            "content": (
-                f"Autonomous task: {item['item']}\n"
-                f"Why queued: {item.get('reason', '?')}\n\n"
-                "Before starting: use list_files and recall to check past work. "
-                "In one sentence justify why this is genuinely different. Then do it. "
-                "When done, write a note summarising what you built. "
-                "If the result is interesting enough that Basil should know, "
-                "use say_proactively to surface it."
-            ),
-        }]
+        history = [{"role": "user", "content": goal_text}]
+        result = ""
+        retries = 0
+        verdict = None
 
-        try:
-            result = run_turn(client, model, mode, history)
-            with PRINT_LOCK:
-                print(f"[Clyde] Background done: {result[:200]}", flush=True)
-            log_event("background_done", {"item": item["item"], "result": result[:500]})
+        while True:
+            try:
+                result = run_turn(client, model, mode, history)
+            except Exception as e:
+                result = f"(error: {e})"
+                log_event("background_error", {"tag": tag, "error": str(e)})
+                break
+
+            verdict = _critic.judge(goal_text, result)
+            log_event("critic_verdict", {
+                "tag": tag,
+                "done": verdict.get("done"),
+                "missing": verdict.get("missing", [])[:3],
+                "retry": retries,
+            })
+            if verdict.get("done"):
+                break
+            if retries >= CRITIC_MAX_RETRIES:
+                break
+
+            retries += 1
+            missing_str = "; ".join(verdict.get("missing", []) or [])
+            history.append({
+                "role": "user",
+                "content": (
+                    "The critic says this isn't done yet. "
+                    f"Missing: {missing_str or '(no specifics)'}.\n\n"
+                    + (verdict.get("retry_with") or "Finish it.")
+                ),
+            })
+
+        with PRINT_LOCK:
+            tail = (
+                f" (verdict: {'done' if verdict and verdict.get('done') else 'incomplete'}"
+                f"{', retries=' + str(retries) if retries else ''})"
+            )
+            print(f"[Clyde] Background {tag} → {result[:160]}{tail}", flush=True)
+        log_event("background_done", {
+            "tag": tag,
+            "result": result[:500],
+            "verdict": verdict,
+            "retries": retries,
+        })
+
+        if kind == "queue":
+            idx, item = payload
+            queue_file = MEMORY_DIR / "work_queue.jsonl"
+            lines = queue_file.read_text().splitlines()
             lines[idx] = json.dumps({
                 **json.loads(lines[idx]),
-                "done": True,
+                "done": bool(verdict and verdict.get("done")),
                 "completed": now(),
                 "result": result[:300],
+                "retries": retries,
             })
-        except Exception as e:
-            with PRINT_LOCK:
-                print(f"[Clyde] Background error: {e}", flush=True)
-            log_event("background_error", {"item": item["item"], "error": str(e)})
-            lines[idx] = json.dumps({
-                **json.loads(lines[idx]),
-                "done": False,
-                "error": str(e),
-                "last_attempt": now(),
-            })
+            queue_file.write_text("\n".join(lines) + "\n")
 
-        queue_file.write_text("\n".join(lines) + "\n")
+
+# ── Notice loop ──────────────────────────────────────────────────────────────
+#
+# Runs every NOTICE_INTERVAL seconds. Generates candidate proactive
+# messages from recent state, filters each through a strict critic
+# calibrated against past kept/rejected nudges, emits survivors to the
+# proactive channel. Set CLYDE_NOTICE_INTERVAL=0 to disable entirely.
+
+def notice_loop() -> None:
+    if NOTICE_INTERVAL <= 0:
+        return
+    # Initial delay so the agent has some state to scan before the first
+    # tick — otherwise it produces nothing useful on first run.
+    time.sleep(min(NOTICE_INTERVAL, 120))
+    while True:
+        try:
+            emitted = _notice.tick()
+            if emitted:
+                log_event("notice_emitted", {"count": emitted})
+        except Exception as e:
+            log_event("notice_error", {"error": str(e)})
+        time.sleep(NOTICE_INTERVAL)
 
 
 # ── Text mode ─────────────────────────────────────────────────────────────────
@@ -607,6 +756,7 @@ def main() -> None:
     threading.Thread(
         target=background_loop, args=(client, model, mode), daemon=True,
     ).start()
+    threading.Thread(target=notice_loop, daemon=True).start()
 
     run_text_mode(client, model, mode)
 

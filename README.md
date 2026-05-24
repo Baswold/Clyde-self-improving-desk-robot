@@ -23,20 +23,48 @@ python core.py --voice
 
 ## How it works
 
-Three loops run together:
+Four loops run together:
 
 1. **Conversation** — you talk, Clyde replies. When it can't do
-   something it writes a new tool, hot-loads it, and uses it in the same
-   turn.
-2. **Scheduler** — ticks every second, fires pending timers, alarms, and
-   scheduled messages into Clyde's proactive output channel.
-3. **Background** — every few minutes, pulls the next item from the
-   work queue, checks past projects to avoid repeating itself, then
-   either does the work silently or surfaces results via
-   `say_proactively`.
+   something it writes a new tool, hot-loads it, and uses it in the
+   same turn.
+2. **Scheduler** — ticks every second, fires pending timers, alarms,
+   and scheduled messages into Clyde's proactive output channel.
+3. **Background** — every few minutes, prefers advancing an existing
+   active project; otherwise pulls from the work queue. Every result
+   gets a strict critic verdict; if the critic says "not done", the
+   turn retries (up to a budget) with the critic's missing-list
+   pushed back into context. Kills the "agent declares victory after
+   writing a plan" failure mode.
+4. **Notice** — every 30 min (configurable via
+   `CLYDE_NOTICE_INTERVAL`; `0` disables), scans recent events,
+   facts, schedules and active projects looking for things worth
+   saying unprompted. Each candidate passes through a second LLM
+   call — the *nudge filter* — calibrated against past kept/rejected
+   nudges. Survivors hit the proactive queue.
 
 Proactive messages appear between user prompts in text mode, or are
 spoken straight away in voice mode.
+
+### Projects vs. work-queue items
+
+The **work queue** is for short one-shot tasks. The **project store**
+(`memory/projects.jsonl`) is for anything that won't finish in one
+background turn — multi-step builds, debugging investigations,
+self-modification. `start_project(goal, plan)` creates one; the
+background loop advances the least-recently-touched active project
+before starting anything new, so long things actually finish across
+restarts.
+
+### Self-modification with a sandbox
+
+`try_self_change(path, content, [test_command])` is the safe edit for
+anything in the agent's own runtime — `core.py`, `voice.py`, any
+`_*.py`, `system_prompt.md`. It copies the project to
+`workspace/sandbox/`, applies the change, runs an import + tool-load
+smoke test, and promotes to the live tree only on pass. `edit_file`
+is still fine for tool files and scratch — a broken tool just fails
+to load.
 
 ## File structure
 
@@ -60,13 +88,24 @@ tools/               — one .py file per capability
   schedule.py        — set_timer, set_alarm, schedule_message,
                        list_schedules, cancel_schedule
   say.py             — say_proactively (interrupt with a message)
+  projects.py        — start_project, advance_project, list_projects
+  try_self_change.py — sandboxed self-modification
+  find_in_events.py  — search the event log by keyword
   deploy_self.py     — copy Clyde to another machine via SSH
+_critic.py           — completion verifier (single-shot LLM)
+_notice.py           — proactive nudge generator + filter
+_llm.py              — single-shot LLM helper shared by critic/notice
+_projects.py         — lock-protected project store
+_proactive.py        — shared proactive output queue
+_schedule.py         — lock-protected schedule store
 memory/
   facts.jsonl        — durable facts
   events.jsonl       — log of everything that happens
   notes.md           — long-form notes
-  work_queue.jsonl   — things to do when idle
+  work_queue.jsonl   — short tasks to do when idle
+  projects.jsonl     — long-running projects across sessions
   schedule.jsonl     — timers + alarms + scheduled messages
+  nudge_log.jsonl    — every proactive nudge + filter verdict
 workspace/           — scratch space for projects Clyde builds
 backups/             — automatic backups before any file edit
 ```
