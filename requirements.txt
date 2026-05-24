@@ -2,7 +2,17 @@ anthropic>=0.40.0
 openai>=1.50.0
 python-dotenv>=1.0.0
 
-# Voice mode (optional — only needed for `python core.py --voice`)
+# Voice mode (also reused by the inter-instance bus).
 websockets>=12.0
 sounddevice>=0.4.6
 numpy>=1.26
+
+# Hardware (optional — Pi / desk with serial peripherals).
+pyserial>=3.5
+
+# Vision (optional — webcam capture + scene description).
+opencv-python-headless>=4.9
+
+# Face recognition (optional — heavy on Pi; dlib compile required).
+# Uncomment if you want local face matching instead of LLM fallback.
+# face_recognition>=1.3

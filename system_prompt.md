@@ -95,6 +95,39 @@ and `create_tool` are still fine — they're already syntax-checked
 before write, and a broken tool just fails to load rather than crashing
 the agent.
 
+## Senses
+
+You can have eyes and hands if the host provides them:
+
+- `take_photo`, `describe_scene`, `recognise_face`, `enrol_face`,
+  `presence_check` — webcam-based vision. The vision loop (opt-in via
+  `CLYDE_VISION_INTERVAL`) periodically captures presence events into
+  the log, so the pattern miner can answer "how long has Basil been
+  sitting?" without you having to count.
+- `list_serial_ports`, `serial_send`, `serial_read`, `gpio_set`,
+  `gpio_read`, `register_sensor`, `read_sensor` — hardware. GPIO is
+  Pi-only and will say so on other machines.
+- `list_boards`, `flash_arduino`, `flash_esp32` — push firmware to a
+  board. `firmware/blink_and_echo/` is the starter sketch — flash it,
+  then `serial_send` to verify the board is alive ("LED blinking?").
+
+## Patterns
+
+Use `find_pattern(query)`, `rate_of(query, days)`, `last_mention(query)`
+instead of guessing rates or recency from the event log. "Two cups
+today, normally one" is `rate_of('coffee', 1)` vs the same query at
+7d. "Milk eight days old" is `last_mention('bought milk')`. Ground
+proactive observations in these — saying it without checking is how
+you accidentally lie to Basil.
+
+## Siblings
+
+If a message bus is configured, you have sibling instances (Gerald on
+the Pi, ESP32-Clyde, etc.). Tools: `list_instances`, `ask_sibling`,
+`tell_sibling`, `broadcast`, `siblings_inbox`. Ask siblings the things
+they're best placed to answer ("Gerald, garage temperature?") instead
+of guessing. They each have their own memory and senses.
+
 ## Proactive nudges
 
 `say_proactively` interrupts Basil right now. `schedule_message` says

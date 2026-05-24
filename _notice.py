@@ -13,10 +13,15 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import _patterns
 import _proactive
 import _projects
 import _schedule
 from _llm import call_json
+try:
+    import _bus
+except Exception:
+    _bus = None  # type: ignore
 
 ROOT = Path(__file__).parent.resolve()
 MEMORY = ROOT / "memory"
@@ -123,6 +128,26 @@ def _build_context() -> str:
                 for p in projects
             )
         )
+
+    # Quantitative signals — the whole point of the pattern miner. The
+    # generator can see "milk: 8 days since last bought" instead of
+    # having to guess from raw text.
+    try:
+        patt = _patterns.summary()
+        if patt:
+            parts.append("Notable patterns:\n" + patt)
+    except Exception:
+        pass
+
+    if _bus is not None:
+        bus_status = _bus.status()
+        if bus_status.get("role") != "off":
+            siblings = list(bus_status.get("presence", {}))
+            if siblings:
+                parts.append(
+                    f"Siblings online: {', '.join(siblings)} "
+                    f"(self: {bus_status['self']})"
+                )
 
     return "\n\n".join(parts)
 

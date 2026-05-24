@@ -23,7 +23,7 @@ python core.py --voice
 
 ## How it works
 
-Four loops run together:
+Five loops run together (the last two are opt-in):
 
 1. **Conversation** — you talk, Clyde replies. When it can't do
    something it writes a new tool, hot-loads it, and uses it in the
@@ -55,6 +55,32 @@ self-modification. `start_project(goal, plan)` creates one; the
 background loop advances the least-recently-touched active project
 before starting anything new, so long things actually finish across
 restarts.
+
+### Senses, signals, siblings
+
+- **Vision** (`take_photo`, `describe_scene`, `recognise_face`,
+  `enrol_face`, `presence_check`) uses opencv for capture and the
+  configured LLM for scene description. Set `CLYDE_VISION_INTERVAL>0`
+  to enable the periodic presence-logging loop. `face_recognition`
+  (dlib) gives local face matching; without it `recognise_face`
+  falls back to asking the vision LLM.
+- **Hardware** (`list_serial_ports`, `serial_send`, `serial_read`,
+  `gpio_set`, `gpio_read`, `register_sensor`, `read_sensor`,
+  `list_boards`, `flash_arduino`, `flash_esp32`). GPIO is Pi-only
+  and says so on other machines. `firmware/blink_and_echo/` is the
+  starter sketch — flash it, then `serial_send` "ping" and expect
+  "ok: ping" back.
+- **Inter-instance bus** (`list_instances`, `ask_sibling`,
+  `tell_sibling`, `broadcast`, `siblings_inbox`). Peer-to-peer over
+  websockets — one instance is the hub (`CLYDE_HUB=1`), others
+  connect via `CLYDE_HUB_HOST`. Each instance has a name
+  (`CLYDE_INSTANCE_NAME`, default hostname). Ask-replies use a
+  bounded single-shot LLM call so they don't recurse.
+- **Pattern miner** (`find_pattern`, `rate_of`, `last_mention`).
+  Quantitative analysis over `events.jsonl`. The notice loop now
+  receives a "Notable patterns" section (large rate deltas, stale
+  inventory items) so it grounds nudges in numbers rather than
+  guessing from raw event text.
 
 ### Self-modification with a sandbox
 

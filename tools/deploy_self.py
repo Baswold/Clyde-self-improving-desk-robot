@@ -9,31 +9,29 @@ SCHEMA = {
     "name": "deploy_self",
     "description": (
         "Copy Clyde to another machine via rsync and start it there. "
-        "Reads GERALD_HOST and GERALD_USER from environment (defaults to Pi 3B+). "
-        "The remote instance runs independently and can be reached on its control port."
+        "Reads GERALD_HOST and GERALD_USER from environment by default. "
+        "The remote instance runs independently. If a message bus is "
+        "configured locally, the new instance can be wired to join it via "
+        "instance_name + hub_host."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "host": {
+            "host": {"type": "string", "description": "Remote host. Default GERALD_HOST."},
+            "user": {"type": "string", "description": "Remote user. Default GERALD_USER."},
+            "remote_dir": {"type": "string", "description": "Install path. Default ~/clyde."},
+            "start": {"type": "boolean", "description": "Start core.py after deploy. Default true."},
+            "instance_name": {
                 "type": "string",
-                "description": "Remote hostname or IP. Defaults to GERALD_HOST env var."
+                "description": "Sibling identity (e.g. 'gerald'). Sets CLYDE_INSTANCE_NAME on the remote.",
             },
-            "user": {
+            "hub_host": {
                 "type": "string",
-                "description": "Remote username. Defaults to GERALD_USER env var."
+                "description": "Bus hub the remote should connect to. Sets CLYDE_HUB_HOST.",
             },
-            "remote_dir": {
-                "type": "string",
-                "description": "Where to install on the remote machine. Default: ~/clyde"
-            },
-            "start": {
-                "type": "boolean",
-                "description": "Whether to start core.py after deploying. Default true."
-            }
         },
-        "required": []
-    }
+        "required": [],
+    },
 }
 
 
@@ -50,6 +48,8 @@ def deploy_self(
     user: str = "",
     remote_dir: str = "~/clyde",
     start: bool = True,
+    instance_name: str = "",
+    hub_host: str = "",
 ) -> str:
     host = host or os.getenv("GERALD_HOST", "")
     user = user or os.getenv("GERALD_USER", "basil")
@@ -82,7 +82,27 @@ def deploy_self(
     rc, out = _run(pip_cmd, timeout=120)
     lines.append(out or "(pip ok)")
 
-    # 3. Start agent in background
+    # 3. Optionally write/update env on the remote so the new instance
+    #    knows its identity and where to find the bus hub.
+    if instance_name or hub_host:
+        env_lines = []
+        if instance_name:
+            env_lines.append(f"CLYDE_INSTANCE_NAME={instance_name}")
+        if hub_host:
+            env_lines.append(f"CLYDE_HUB_HOST={hub_host}")
+        env_blob = "\\n".join(env_lines)
+        # Append (don't overwrite) so an existing .env's API keys survive.
+        env_cmd = (
+            f"ssh {target} "
+            f"\"mkdir -p {remote_dir} && "
+            f"touch {remote_dir}/.env && "
+            f"printf '\\n%s\\n' '{env_blob}' >> {remote_dir}/.env\""
+        )
+        lines.append("Configuring remote .env ...")
+        rc, out = _run(env_cmd, timeout=30)
+        lines.append(out or "(env updated)")
+
+    # 4. Start agent in background
     if start:
         start_cmd = (
             f"ssh {target} "

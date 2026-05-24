@@ -34,6 +34,9 @@ MAX_TOOL_RESULT = 4000          # chars before truncation
 BACKGROUND_INTERVAL = 300       # seconds between deep-work cycles
 SCHEDULER_TICK = 1.0            # seconds between scheduler checks
 NOTICE_INTERVAL = int(os.getenv("CLYDE_NOTICE_INTERVAL", "1800"))
+VISION_INTERVAL = int(os.getenv("CLYDE_VISION_INTERVAL", "0"))
+# ^ 0 disables the vision loop. >0 means "every N seconds capture a
+#   frame and log a presence event". Defaults off for privacy + battery.
 # ^ 0 disables the notice loop. Default 30 min. The loop runs two cheap
 #   LLM calls per candidate (generator + filter), so cost scales with how
 #   often it runs and how much state has accumulated.
@@ -48,12 +51,18 @@ for d in [TOOLS_DIR, MEMORY_DIR, ROOT / "workspace", ROOT / "backups"]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import _bus        # noqa: E402
 import _critic     # noqa: E402
 import _notice     # noqa: E402
+import _patterns   # noqa: E402
 import _proactive  # noqa: E402
 import _projects   # noqa: E402
 import _registry   # noqa: E402
 import _schedule   # noqa: E402
+try:
+    import _vision  # noqa: E402  (optional — needs cv2)
+except Exception:
+    _vision = None  # type: ignore
 
 
 # Backwards-compatible aliases — older code (and the voice client) expects
@@ -253,7 +262,16 @@ def memory_context(memo: str = "") -> str:
 def system_prompt(memo: str = "") -> str:
     prompt_file = ROOT / "system_prompt.md"
     base = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else "You are Clyde."
-    return base + "\n\n## Current time\n" + now() + memory_context(memo)
+
+    identity = f"\n\n## Identity\nYou are {_bus.instance_name()}."
+    bus_status = _bus.status()
+    if bus_status.get("role") != "off":
+        siblings = list(bus_status.get("presence", {}))
+        if siblings:
+            identity += f" Other instances online: {', '.join(siblings)}."
+        identity += " Use ask_sibling / tell_sibling / broadcast to coordinate."
+
+    return base + identity + "\n\n## Current time\n" + now() + memory_context(memo)
 
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────
@@ -672,6 +690,54 @@ def notice_loop() -> None:
         time.sleep(NOTICE_INTERVAL)
 
 
+# ── Vision loop ──────────────────────────────────────────────────────────────
+#
+# Opt-in (CLYDE_VISION_INTERVAL > 0). Each tick captures a frame, checks
+# presence cheaply, and logs the result as an event so the pattern miner
+# can compute "how long has Basil been at the desk" from raw data.
+
+def vision_loop() -> None:
+    if VISION_INTERVAL <= 0 or _vision is None:
+        return
+    while True:
+        try:
+            result = _vision.presence_check()
+            log_event("presence", {"result": result})
+        except Exception as e:
+            log_event("vision_error", {"error": str(e)})
+        time.sleep(VISION_INTERVAL)
+
+
+# ── Bus ask-handler ──────────────────────────────────────────────────────────
+#
+# When a sibling sends `ask`, we answer with a bounded single-shot LLM
+# call — no tool use, no multi-turn. Keeps cross-instance calls cheap
+# and prevents recursive "ask my sibling who asks me" loops.
+
+def _bus_ask_handler(from_name: str, question: str) -> str:
+    try:
+        from _llm import make_client
+    except Exception as e:
+        return f"(no LLM helper: {e})"
+    call, _ = make_client()
+    if call is None:
+        return "(no LLM configured on this instance)"
+    sp = (
+        f"You are {_bus.instance_name()}, a sibling Clyde instance. "
+        f"{from_name} is asking you something over the message bus. "
+        "Reply briefly and concretely with what you actually know — "
+        "don't speculate. One short paragraph max."
+    )
+    try:
+        return call(
+            [{"role": "user", "content": question}],
+            system=sp,
+            max_tokens=400,
+        ).strip()
+    except Exception as e:
+        return f"(error answering: {e})"
+
+
 # ── Text mode ─────────────────────────────────────────────────────────────────
 
 def run_text_mode(client, model: str, mode: str) -> None:
@@ -757,6 +823,12 @@ def main() -> None:
         target=background_loop, args=(client, model, mode), daemon=True,
     ).start()
     threading.Thread(target=notice_loop, daemon=True).start()
+    if VISION_INTERVAL > 0 and _vision is not None:
+        threading.Thread(target=vision_loop, daemon=True).start()
+
+    # Bus (optional). Started here so the ask-handler closes over the
+    # already-loaded tools/LLM config.
+    _bus.start(ask_handler=_bus_ask_handler)
 
     run_text_mode(client, model, mode)
 

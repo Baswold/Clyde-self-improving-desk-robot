@@ -154,24 +154,31 @@ async def _amain(
     async with websockets.connect(url, extra_headers=headers, max_size=2**24) as ws:
 
         # ── Session config ────────────────────────────────────────────────
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "modalities": ["audio", "text"],
-                "instructions": _voice_instructions(system_prompt("")),
-                "voice": os.getenv("CLYDE_VOICE", "Cherry"),
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "qwen3-omni-asr"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "silence_duration_ms": 600,
-                },
-                "tools": _schemas_to_realtime(tool_schemas),
-                "tool_choice": "auto",
+        session = {
+            "modalities": ["audio", "text"],
+            "instructions": _voice_instructions(system_prompt("")),
+            "voice": os.getenv("CLYDE_VOICE", "Cherry"),
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {"model": "qwen3-omni-asr"},
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "silence_duration_ms": 600,
             },
-        }))
+            "tools": _schemas_to_realtime(tool_schemas),
+            "tool_choice": "auto",
+        }
+        # Voice cloning: if CLYDE_VOICE_REF points at a short reference
+        # audio file, send it so per-instance personas (Gerald vs Clyde)
+        # can sound distinct.
+        ref_path = os.getenv("CLYDE_VOICE_REF", "")
+        if ref_path and Path(ref_path).exists():
+            session["voice_clone"] = {
+                "audio": base64.b64encode(Path(ref_path).read_bytes()).decode(),
+                "format": "wav",
+            }
+        await ws.send(json.dumps({"type": "session.update", "session": session}))
 
         mic_q, spk_put, stopping, stop_audio = _open_audio()
         loop = asyncio.get_event_loop()
